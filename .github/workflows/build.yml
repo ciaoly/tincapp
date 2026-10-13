@@ -40,10 +40,17 @@ jobs:
 
       # The Android Gradle plugin downloads the NDK named by ndkVersion, which
       # is a little under a gigabyte; cache it so only the first run pays that.
+      #
+      # $ANDROID_HOME has to be copied into the workflow environment first:
+      # actions/cache expands its path as an expression, and expressions see
+      # only the env blocks of the workflow, not the runner's own variables.
+      - name: Locate the Android SDK
+        run: echo "ANDROID_SDK_ROOT=${ANDROID_HOME:?the runner image sets ANDROID_HOME}" >> "$GITHUB_ENV"
+
       - name: Cache Android NDK
         uses: actions/cache@v4
         with:
-          path: ${{ env.ANDROID_HOME }}/ndk
+          path: ${{ env.ANDROID_SDK_ROOT }}/ndk
           key: ndk-29.0.14206865-${{ runner.os }}
 
       - name: Build APKs
