@@ -14,66 +14,191 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-cmake_minimum_required(VERSION 3.4.1)
-include(ExternalProject)
+# Builds the tinc daemon and control program bundled with the app.
+#
+# The upstream project builds with autotools; the tinc revision tracked here
+# (see ../.gitmodules) is built by Meson instead, and adds a WebSocket
+# metadata transport backed by wslay. Rather than pull another build system
+# into the Android build, the sources are compiled directly: the source lists
+# below mirror what `meson setup -Dcrypto=nolegacy -Dwebsocket=enabled ...`
+# compiles, and src/main/c/tinc-config/config.h carries the feature detection
+# Meson would have produced.
+#
+# tinc and tincd are executables, but Android only packages shared objects
+# into the application's native library directory -- the one place the app can
+# execute them from. They are therefore copied to libtinc.so/libtincd.so, as
+# the previous autotools-based build did.
 
-set(CC_OPTIMISATION_FLAGS "-ffunction-sections -fdata-sections")
-set(LD_OPTIMISATION_FLAGS "-Wl,--gc-sections")
+cmake_minimum_required(VERSION 3.22)
 
-set(xCONFIG
-  "CC=${CMAKE_C_COMPILER} \
-    ${CMAKE_C_COMPILE_OPTIONS_EXTERNAL_TOOLCHAIN}${CMAKE_C_COMPILER_EXTERNAL_TOOLCHAIN} \
-    ${CMAKE_C_COMPILE_OPTIONS_TARGET}${CMAKE_C_COMPILER_TARGET} \
-    ${CMAKE_C_COMPILE_OPTIONS_SYSROOT}${CMAKE_SYSROOT}"
-  "LD=${CMAKE_LINKER}"
-  "AR=${CMAKE_AR}"
-  "RANLIB=${CMAKE_RANLIB}"
-  "CFLAGS=${CMAKE_C_FLAGS} ${CC_OPTIMISATION_FLAGS}"
-  "LDFLAGS=${CMAKE_SHARED_LINKER_FLAGS} ${LD_OPTIMISATION_FLAGS}"
-  "--host=${CMAKE_C_COMPILER_TARGET}"
-)
+project(tincapp-native C)
 
-ExternalProject_Add(lzo
-  URL               http://www.oberhumer.com/opensource/lzo/download/lzo-2.10.tar.gz
-  URL_HASH          SHA1=4924676a9bae5db58ef129dc1cebce3baa3c4b5d
-  CONFIGURE_COMMAND <SOURCE_DIR>/configure ${xCONFIG} --disable-shared
-  BUILD_COMMAND     make -j8
-  INSTALL_COMMAND   make install DESTDIR=${CMAKE_CURRENT_BINARY_DIR} &&
-                    rm -r <BINARY_DIR>
-)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
 
-ExternalProject_Add(libressl
-  URL               https://ftp.openbsd.org/pub/OpenBSD/LibreSSL/libressl-4.3.2.tar.gz
-  URL_HASH          SHA256=edf01aee24c65d69e6a9efcb9d44bcda682ff9d4f3bbbd95e794e1dfa90847b5
-  CONFIGURE_COMMAND <SOURCE_DIR>/configure ${xCONFIG} --disable-shared
-  BUILD_COMMAND     make -j8 -C crypto
-  INSTALL_COMMAND   make -C crypto install DESTDIR=${CMAKE_CURRENT_BINARY_DIR} &&
-                    make -C include install DESTDIR=${CMAKE_CURRENT_BINARY_DIR} &&
-                    rm -r <BINARY_DIR>
-)
+set(TINC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/main/c/tinc")
+set(TINC_CONFIG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/main/c/tinc-config")
 
-ExternalProject_Add(tinc
-  DEPENDS           lzo libressl
-  URL               https://tinc-vpn.org/packages/tinc-1.1pre18.tar.gz
-  URL_HASH          SHA256=2757ddc62cf64b411f569db2fa85c25ec846c0db110023f6befb33691f078986
-  # Backport from https://github.com/pacien/tinc/commit/14de269d013f72d797c3baf249fdec65bdbcee89
-  PATCH_COMMAND     patch -p1 < ${PROJECT_SOURCE_DIR}/src/main/c/tinc-async-resolver.patch
-  CONFIGURE_COMMAND autoreconf -fsi <SOURCE_DIR> &&
-                    <SOURCE_DIR>/configure ${xCONFIG}
-                      --with-openssl=${CMAKE_CURRENT_BINARY_DIR}/usr/local
-                      --with-lzo=${CMAKE_CURRENT_BINARY_DIR}/usr/local
-                      --disable-curses
-                      --disable-readline
-  BUILD_COMMAND     make -j8 -C src
-  INSTALL_COMMAND   make -C src install DESTDIR=${CMAKE_CURRENT_BINARY_DIR} &&
-                    ${CMAKE_COMMAND} -E copy
-                      ${CMAKE_CURRENT_BINARY_DIR}/usr/local/sbin/tinc
-                      ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/libtinc.so &&
-                    ${CMAKE_COMMAND} -E copy
-                      ${CMAKE_CURRENT_BINARY_DIR}/usr/local/sbin/tincd
-                      ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/libtincd.so &&
-                    rm -r <BINARY_DIR>
-)
+if(NOT EXISTS "${TINC_DIR}/src/meta_ws.c")
+  message(FATAL_ERROR
+    "The tinc submodule is missing or out of date.\n"
+    "Run: git submodule update --init --recursive")
+endif()
 
+# The Android Gradle plugin points this at the per-ABI obj directory that gets
+# packaged into the APK; the fallback keeps a standalone CMake run usable.
+if(NOT CMAKE_LIBRARY_OUTPUT_DIRECTORY)
+  set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
+endif()
+
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/wslay.cmake")
+
+# version.c includes version_git.h, which Meson fills in from `git describe`.
+set(TINC_VERSION_STRING "1.1-ws.3" CACHE STRING "Build version reported by tinc")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/version_git.h"
+  "#define GIT_DESCRIPTION \"${TINC_VERSION_STRING}\"\n")
+
+# --- tinc sources ------------------------------------------------------------
+# Mirrors src/meson.build. `-Dcrypto=nolegacy` replaces the OpenSSL backend
+# with the bundled Ed25519 and ChaCha20-Poly1305 implementations, so neither
+# cipher.c/digest.c (legacy RSA/AES) nor any external crypto library is needed.
+
+set(TINC_SRC "${TINC_DIR}/src")
+
+set(TINC_COMMON_SOURCES
+  "${TINC_SRC}/conf.c"
+  "${TINC_SRC}/console.c"
+  "${TINC_SRC}/dropin.c"
+  "${TINC_SRC}/fs.c"
+  "${TINC_SRC}/keys.c"
+  "${TINC_SRC}/list.c"
+  "${TINC_SRC}/logger.c"
+  "${TINC_SRC}/names.c"
+  "${TINC_SRC}/netutl.c"
+  "${TINC_SRC}/pidfile.c"
+  "${TINC_SRC}/random.c"
+  "${TINC_SRC}/sandbox.c"
+  "${TINC_SRC}/script.c"
+  "${TINC_SRC}/splay_tree.c"
+  "${TINC_SRC}/sptps.c"
+  "${TINC_SRC}/subnet_parse.c"
+  "${TINC_SRC}/utils.c"
+  "${TINC_SRC}/version.c"
+  "${TINC_SRC}/xoshiro.c"
+  # crypto backend: nolegacy
+  "${TINC_SRC}/nolegacy/crypto.c"
+  "${TINC_SRC}/nolegacy/prf.c"
+  # bundled ChaCha20-Poly1305 AEAD
+  "${TINC_SRC}/chacha-poly1305/chacha-poly1305.c"
+  "${TINC_SRC}/chacha-poly1305/chacha.c"
+  "${TINC_SRC}/chacha-poly1305/poly1305.c"
+  # bundled Ed25519
+  "${TINC_SRC}/ed25519/ecdh.c"
+  "${TINC_SRC}/ed25519/ecdsa.c"
+  "${TINC_SRC}/ed25519/ecdsagen.c"
+  "${TINC_SRC}/ed25519/fe.c"
+  "${TINC_SRC}/ed25519/ge.c"
+  "${TINC_SRC}/ed25519/key_exchange.c"
+  "${TINC_SRC}/ed25519/keypair.c"
+  "${TINC_SRC}/ed25519/sc.c"
+  "${TINC_SRC}/ed25519/sha512.c"
+  "${TINC_SRC}/ed25519/sign.c"
+  "${TINC_SRC}/ed25519/verify.c")
+
+set(TINC_CLI_SOURCES
+  "${TINC_SRC}/fsck.c"
+  "${TINC_SRC}/ifconfig.c"
+  "${TINC_SRC}/info.c"
+  "${TINC_SRC}/invitation.c"
+  "${TINC_SRC}/top.c"
+  "${TINC_SRC}/tincctl.c")
+
+set(TINCD_SOURCES
+  "${TINC_SRC}/address_cache.c"
+  "${TINC_SRC}/autoconnect.c"
+  "${TINC_SRC}/buffer.c"
+  "${TINC_SRC}/conf_net.c"
+  "${TINC_SRC}/connection.c"
+  "${TINC_SRC}/control.c"
+  "${TINC_SRC}/dummy_device.c"
+  "${TINC_SRC}/edge.c"
+  "${TINC_SRC}/event.c"
+  "${TINC_SRC}/fd_device.c"
+  "${TINC_SRC}/graph.c"
+  "${TINC_SRC}/meta.c"
+  "${TINC_SRC}/meta_ws.c"
+  "${TINC_SRC}/multicast_device.c"
+  "${TINC_SRC}/net.c"
+  "${TINC_SRC}/net_packet.c"
+  "${TINC_SRC}/net_setup.c"
+  "${TINC_SRC}/net_socket.c"
+  "${TINC_SRC}/node.c"
+  "${TINC_SRC}/process.c"
+  "${TINC_SRC}/protocol.c"
+  "${TINC_SRC}/protocol_auth.c"
+  "${TINC_SRC}/protocol_edge.c"
+  "${TINC_SRC}/protocol_key.c"
+  "${TINC_SRC}/protocol_misc.c"
+  "${TINC_SRC}/protocol_subnet.c"
+  "${TINC_SRC}/proxy.c"
+  "${TINC_SRC}/raw_socket_device.c"
+  "${TINC_SRC}/route.c"
+  "${TINC_SRC}/signal.c"
+  "${TINC_SRC}/subnet.c"
+  # platform-specific
+  "${TINC_SRC}/linux/device.c"
+  "${TINC_SRC}/linux/event.c"
+  "${TINC_SRC}/tincd.c")
+
+# --- build -------------------------------------------------------------------
+
+# config.h (committed) and version_git.h (generated above) live outside the
+# tinc sources, so they are searched before the submodule's own directories.
+set(TINC_INCLUDE_DIRS
+  "${TINC_CONFIG_DIR}"
+  "${CMAKE_CURRENT_BINARY_DIR}"
+  "${WSLAY_INCLUDES}")
+
+set(TINC_COMPILE_DEFINITIONS
+  _GNU_SOURCE
+  _FILE_OFFSET_BITS=64
+  # wslay headers expect these to come from its generate-a-config.h step,
+  # which is skipped; Android is always little-endian, so WORDS_BIGENDIAN
+  # stays undefined.
+  HAVE_ARPA_INET_H
+  HAVE_NETINET_IN_H
+  WSLAY_VERSION="${WSLAY_VERSION}")
+
+add_library(tinc_common STATIC ${TINC_COMMON_SOURCES})
+target_include_directories(tinc_common PUBLIC ${TINC_INCLUDE_DIRS})
+target_compile_definitions(tinc_common PUBLIC ${TINC_COMPILE_DEFINITIONS})
+
+# Android 15 and later require every program in an APK to work with 16 KiB
+# pages. lld only aligns load segments to the page size reported by the NDK
+# toolchain, which is 4 KiB up to NDK r27, so ask for it explicitly.
+set(TINC_LINK_OPTIONS -Wl,-z,max-page-size=16384)
+
+add_executable(tinc_bin ${TINC_CLI_SOURCES})
+target_link_libraries(tinc_bin PRIVATE tinc_common)
+target_link_options(tinc_bin PRIVATE ${TINC_LINK_OPTIONS})
+
+add_executable(tincd_bin ${TINCD_SOURCES} ${WSLAY_SOURCES})
+target_link_libraries(tincd_bin PRIVATE tinc_common m)
+target_link_options(tincd_bin PRIVATE ${TINC_LINK_OPTIONS})
+
+# Empty library carried over from the previous build (src/main/c/main.c is a
+# placeholder). Nothing links against it; it is kept so the Android Gradle
+# plugin's external native build still has a library target of its own.
 add_library(main SHARED src/main/c/main.c)
-add_dependencies(main tinc)
+
+add_custom_command(TARGET tinc_bin POST_BUILD
+  COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+    "$<TARGET_FILE:tinc_bin>"
+    "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/libtinc.so"
+  COMMENT "Installing libtinc.so")
+
+add_custom_command(TARGET tincd_bin POST_BUILD
+  COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+    "$<TARGET_FILE:tincd_bin>"
+    "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/libtincd.so"
+  COMMENT "Installing libtincd.so")

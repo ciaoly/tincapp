@@ -1,0 +1,3 @@
+[submodule "app/src/main/c/tinc"]
+	path = app/src/main/c/tinc
+	url = https://github.com/ciaoly/tinc
