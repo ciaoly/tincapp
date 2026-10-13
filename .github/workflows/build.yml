@@ -53,58 +53,65 @@ jobs:
         run: |
           set -euo pipefail
 
-          # sed rather than head: head exiting early would give sort a SIGPIPE,
-          # which set -o pipefail turns into a failed step.
-          apk=$(find app/build/outputs/apk -name '*.apk' | sort | sed -n 1p)
+          apks=$(find app/build/outputs/apk -name '*.apk' | sort)
 
-          if [ -z "${apk}" ]; then
+          if [ -z "${apks}" ]; then
             echo "::error::the build produced no APK"
             exit 1
           fi
 
-          echo "Inspecting ${apk}"
-
-          tmp=$(mktemp -d)
-          unzip -q "${apk}" -d "${tmp}"
-
           status=0
 
-          for abi in arm64-v8a armeabi-v7a x86 x86_64; do
-            for lib in libtinc.so libtincd.so; do
-              file="${tmp}/lib/${abi}/${lib}"
+          # Every build type is checked: debug and release compile the native
+          # code with different CMAKE_BUILD_TYPE, so they are not the same
+          # binaries and neither one vouches for the other.
+          for apk in ${apks}; do
+            echo "== ${apk}"
 
-              if [ ! -f "${file}" ]; then
-                echo "::error::${abi}: ${lib} is missing from the APK"
-                status=1
-                continue
-              fi
+            tmp=$(mktemp -d)
+            # -o so a name clash can never turn into an interactive prompt,
+            # which would hang the job instead of failing it.
+            unzip -oq "${apk}" -d "${tmp}"
 
-              # Android 15 and later refuse to load a program whose LOAD
-              # segments are not aligned to a 16 KiB page. readelf failing (a
-              # file that is not an ELF, say) leaves this empty, which the
-              # comparison below reports as such rather than aborting the step.
-              alignment=$(readelf -lW "${file}" 2>/dev/null | awk '$1 == "LOAD" {print $NF}' | sort -u) || true
-              if [ "${alignment}" != "0x4000" ]; then
-                echo "::error::${abi}/${lib}: LOAD alignment is ${alignment}, expected 0x4000"
-                status=1
-              fi
+            for abi in arm64-v8a armeabi-v7a x86 x86_64; do
+              for lib in libtinc.so libtincd.so; do
+                file="${tmp}/lib/${abi}/${lib}"
 
-              # Catches the submodule being pinned to a revision without the
-              # WebSocket metadata transport, which would otherwise link.
-              # It lives in tincd only: the CLI does not compile meta_ws.c.
-              if [ "${lib}" = "libtincd.so" ] && ! strings "${file}" | grep -q 'Sec-WebSocket-Accept'; then
-                echo "::error::${abi}/${lib}: no WebSocket metadata transport compiled in"
-                status=1
-              fi
+                if [ ! -f "${file}" ]; then
+                  echo "::error::${apk}: ${abi}/${lib} is missing"
+                  status=1
+                  continue
+                fi
 
-              # The version comes from the CMake TINC_VERSION_STRING setting.
-              if ! strings "${file}" | grep -q '1\.1-ws'; then
-                echo "::error::${abi}/${lib}: expected tinc version string not found"
-                status=1
-              fi
+                # Android 15 and later refuse to load a program whose LOAD
+                # segments are not aligned to a 16 KiB page. readelf failing (a
+                # file that is not an ELF, say) leaves this empty, which the
+                # comparison below reports as such rather than aborting the step.
+                alignment=$(readelf -lW "${file}" 2>/dev/null | awk '$1 == "LOAD" {print $NF}' | sort -u) || true
+                if [ "${alignment}" != "0x4000" ]; then
+                  echo "::error::${apk}: ${abi}/${lib} LOAD alignment is '${alignment}', expected 0x4000"
+                  status=1
+                fi
 
-              echo "${abi}/${lib}: LOAD alignment ${alignment}"
+                # Catches the submodule being pinned to a revision without the
+                # WebSocket metadata transport, which would otherwise link.
+                # It lives in tincd only: the CLI does not compile meta_ws.c.
+                if [ "${lib}" = "libtincd.so" ] && ! strings "${file}" | grep -q 'Sec-WebSocket-Accept'; then
+                  echo "::error::${apk}: ${abi}/${lib} has no WebSocket metadata transport"
+                  status=1
+                fi
+
+                # The version comes from the CMake TINC_VERSION_STRING setting.
+                if ! strings "${file}" | grep -q '1\.1-ws'; then
+                  echo "::error::${apk}: ${abi}/${lib} has no tinc version string"
+                  status=1
+                fi
+
+                echo "   ${abi}/${lib}: OK (alignment ${alignment})"
+              done
             done
+
+            rm -rf "${tmp}"
           done
 
           exit "${status}"
